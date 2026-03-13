@@ -2965,11 +2965,13 @@ function doLogout() {
   currentUser = null;
   localStorage.removeItem('sa_token');
 
-  // ── Xóa sạch state runtime — không lẫn data sang user mới ──
-  playerCoins   = 0;
-  ownedItems    = new Set();
-  equippedItems = {};
-  campProgress  = { cleared: [] };
+  // Reset toàn bộ state runtime — không lẫn data sang account khác
+  playerCoins      = 0;
+  ownedItems       = new Set();
+  equippedItems    = {};
+  campProgress     = { cleared: [] };
+  usedCodes        = [];       // reset per-account codes
+  hasBulletFireSkin = false;   // reset per-account skin
   initDefaultOwned();
   updateCoinUI();
   updateUserBadge();
@@ -2978,19 +2980,20 @@ function doLogout() {
 
 // ── Sau khi auth thành công ───────────────────────────────────
 function onAuthSuccess(data) {
-  // Reset state user cũ TRƯỚC — tránh lẫn data giữa các tài khoản
-  playerCoins   = 0;
-  ownedItems    = new Set();
-  equippedItems = {};
-  campProgress  = { cleared: [] };
+  // Reset TOÀN BỘ state user cũ trước — tránh lẫn data giữa các tài khoản
+  playerCoins      = 0;
+  ownedItems       = new Set();
+  equippedItems    = {};
+  campProgress     = { cleared: [] };
+  usedCodes        = [];
+  hasBulletFireSkin = false;
   initDefaultOwned();
 
   currentUser = { username: data.username, token: data.token, stats: data.stats };
   localStorage.setItem('sa_token', data.token);
-  // Ưu tiên campProgress từ server
   if (data.campProgress) campProgress = data.campProgress;
 
-  // Load shop data từ server — coinLoad sẽ KHÔNG đọc localStorage vì currentUser đã set
+  // Load shopData từ server → coinLoad sẽ khôi phục coins, items, usedCodes, bulletSkin
   if (data.token) {
     apiCall('GET', '/api/shop', null, data.token).then(r => {
       coinLoad(r?.shopData || null);
@@ -3161,8 +3164,9 @@ async function tryAutoLogin() {
   currentUser = { username: data.username, token, stats: data.stats };
   if (data.campProgress) campProgress = data.campProgress;
   else campProgress = { cleared: [] };
-  // Reset shop state trước khi load từ server — tránh dính data cũ
+  // Reset shop state + per-account data trước khi load từ server
   playerCoins = 0; ownedItems = new Set(); equippedItems = {};
+  usedCodes = []; hasBulletFireSkin = false;
   initDefaultOwned();
   apiCall('GET', '/api/shop', null, token).then(r => {
     coinLoad(r?.shopData || null);
@@ -3305,44 +3309,45 @@ function initDefaultOwned() {
 
 // ── Lưu / Load coin ──────────────────────────────────────────
 function coinSave() {
-  const data = { coins: playerCoins, owned: [...ownedItems], equipped: equippedItems };
-  // Lưu server (ưu tiên) — mỗi user có data riêng
+  // usedCodes + hasBulletFireSkin lưu TRONG shopData → mỗi tài khoản riêng
+  const data = {
+    coins: playerCoins,
+    owned: [...ownedItems],
+    equipped: equippedItems,
+    usedCodes: [...usedCodes],
+    hasBulletFireSkin
+  };
+  // Lưu server nếu đã login
   if (currentUser?.token) {
     apiCall('POST', '/api/shop', { shopData: data }, currentUser.token);
   }
-  // Lưu local với key riêng theo username (guest dùng key 'guest')
+  // Lưu localStorage với key riêng theo từng username (cache offline / fallback)
   const lsKey = currentUser ? 'sa_shop_' + currentUser.username.toLowerCase() : 'sa_shop_guest';
   try { localStorage.setItem(lsKey, JSON.stringify(data)); } catch {}
 }
 function coinLoad(serverData) {
-  // Nếu có data từ server → dùng ngay, KHÔNG đọc localStorage
-  if (serverData) {
-    playerCoins   = serverData.coins   || 0;
-    ownedItems    = new Set(serverData.owned || []);
-    equippedItems = serverData.equipped || {};
-    initDefaultOwned();
-    updateCoinUI();
-    return;
+  let data = serverData;
+
+  // Nếu server không có data (user mới hoặc lỗi mạng) → thử localStorage per-user làm fallback
+  if (!data && currentUser) {
+    try {
+      const d = localStorage.getItem('sa_shop_' + currentUser.username.toLowerCase());
+      if (d) data = JSON.parse(d);
+    } catch {}
   }
-  // Nếu đang login nhưng server trả null (user mới) → bắt đầu trắng, KHÔNG đọc localStorage
-  if (currentUser) {
-    playerCoins   = 0;
-    ownedItems    = new Set();
-    equippedItems = {};
-    initDefaultOwned();
-    updateCoinUI();
-    return;
+  // Guest → đọc slot guest
+  if (!data && !currentUser) {
+    try { const d = localStorage.getItem('sa_shop_guest'); if(d) data = JSON.parse(d); } catch {}
   }
-  // Chỉ đọc localStorage khi là guest
-  try {
-    const d = localStorage.getItem('sa_shop_guest');
-    if (d) {
-      const parsed = JSON.parse(d);
-      playerCoins   = parsed.coins   || 0;
-      ownedItems    = new Set(parsed.owned || []);
-      equippedItems = parsed.equipped || {};
-    }
-  } catch {}
+
+  if (data) {
+    playerCoins   = data.coins   || 0;
+    ownedItems    = new Set(data.owned || []);
+    equippedItems = data.equipped || {};
+    // Khôi phục per-account: danh sách code đã dùng & skin lửa
+    if (Array.isArray(data.usedCodes))   usedCodes = data.usedCodes;
+    if (data.hasBulletFireSkin === true) hasBulletFireSkin = true;
+  }
   initDefaultOwned();
   updateCoinUI();
 }
@@ -3624,8 +3629,10 @@ coinLoad();
 // ══════════════════════════════════════════
 // CODE ĐỔI QUÀ
 // ══════════════════════════════════════════
-let usedCodes = JSON.parse(localStorage.getItem('sa_usedCodes')||'[]');
-let hasBulletFireSkin = localStorage.getItem('sa_bulletFire') === '1';
+// usedCodes và hasBulletFireSkin được lưu trong shopData (per-account)
+// KHÔNG đọc từ global localStorage nữa — sẽ được coinLoad() khôi phục
+let usedCodes = [];
+let hasBulletFireSkin = false;
 
 const GIFT_CODES = {
   'VIP999':         { type:'coins', amount:999,  msg:'🎉 +999 XU từ code VIP999!' },
@@ -3664,13 +3671,12 @@ function redeemCode() {
   }
 
   usedCodes.push(code);
-  localStorage.setItem('sa_usedCodes', JSON.stringify(usedCodes));
-
+  // Lưu vào shopData (per-account) thay vì global localStorage
   if (gift.type === 'coins') {
-    addCoins(gift.amount, 'Code Gift');
+    addCoins(gift.amount, 'Code Gift'); // addCoins tự gọi coinSave
   } else if (gift.type === 'bulletSkin') {
     hasBulletFireSkin = true;
-    localStorage.setItem('sa_bulletFire', '1');
+    coinSave(); // lưu hasBulletFireSkin vào shopData
   }
 
   msgEl.textContent = gift.msg;
